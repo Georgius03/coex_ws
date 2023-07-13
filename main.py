@@ -1,16 +1,18 @@
-import math
 import rospy
-import cv2
-from clover import srv
+from clover import srv, long_callback
 from std_srvs.srv import Trigger
-from std_msgs.msg import String
-from sensor_msgs.msg import Image
-from cv_bridge import CvBridge
-from clover import long_callback
-from clover.srv import SetLEDEffect
-from sklearn.cluster import KMeans
+from sensor_msgs.msg import Image, CameraInfo
+from geometry_msgs.msg import PointStamped, Point
 
-color_cloud = []
+import tf2_ros
+import tf2_geometry_msgs
+
+import cv2
+from cv_bridge import CvBridge
+
+from sklearn.cluster import KMeans
+import numpy as np
+import math
 
 
 class COEX:
@@ -45,17 +47,21 @@ class COEX:
 
 class CameraStream:
     def __init__(self):
-        self.pub_cord = rospy.Publisher('color_detect_coords', String, queue_size=10)
-        self.pub_img = rospy.Publisher('color_detect_image', Image, queue_size=10)
-
-        self.sub = rospy.Subscriber('main_camera/image_raw', Image, self.image_callback, queue_size=1)
+        # self.mask_pub = rospy.Publisher('~mask', Image, queue_size=1)
+        # self.point_pub = rospy.Publisher('~debug_cords', PointStamped, queue_size=1)
+        self.stream_sub = rospy.Subscriber('main_camera/image_raw', Image, self.image_callback, queue_size=1)
 
         self.get_telemetry = rospy.ServiceProxy('get_telemetry', srv.GetTelemetry)
-        self.set_effect = rospy.ServiceProxy('led/set_effect', SetLEDEffect)
+        self.set_effect = rospy.ServiceProxy('led/set_effect', srv.SetLEDEffect)
         self.bridge = CvBridge()
 
-        self.current_color = None
-        self.prev_color = None
+        self.camera_info = rospy.wait_for_message('main_camera/camera_info', CameraInfo)
+        self.camera_matrix = np.float64(self.camera_info.K).reshape(3, 3)
+        self.distortion = np.float64(self.camera_info.D).flatten()
+
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
+
         self.color_points_cloud = []
 
     def image_callback(self, msg):
@@ -64,79 +70,85 @@ class CameraStream:
         # convert to HSV to work with color hue
         img_hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
 
-        # cut out a central square
-        w = img.shape[1]
-        h = img.shape[0]
-        r = 5
-        center = img_hsv[h // 2 - r:h // 2 + r, w // 2 - r:w // 2 + r]
+        self.find_centers(img_hsv=img_hsv, msg=msg)
 
-        # compute and print the average hue
-        mean_hue = center[:, :, 0].mean()
-        mean_saturatuion = center[:, :, 1].mean()
-        mean_value = center[:, :, 2].mean()
+    def find_centers(self, img_hsv, msg, mins=90, minv=120, maxs=235, maxv=255):
+        mask_red1 = cv2.inRange(img_hsv, (0, mins, minv), (14, maxs, maxv))
+        mask_red2 = cv2.inRange(img_hsv, (160, mins, minv), (180, maxs, maxv))
 
-        self.current_color = self.get_color_name(mean_hue, mean_saturatuion, mean_value)
-        if self.current_color != 'none':
-            self.set_led_color(self.current_color)
+        mask_red = (cv2.bitwise_or(mask_red1, mask_red2), 'red')
+        mask_yellow = (cv2.inRange(img_hsv, (15, mins, minv), (50, maxs, maxv)), 'yellow')
+        mask_blue = (cv2.inRange(img_hsv, (90, mins, minv), (150, maxs, maxv)), 'blue')
 
-            print(f'{self.current_color}:  hue={mean_hue}, saturation={mean_saturatuion}, value={mean_value}')
+        led_flag = False
+
+        for mask, color in (mask_red, mask_yellow, mask_blue):
+            mask = cv2.erode(mask, kernel=(10, 10), iterations=3)
+            mask = cv2.erode(mask, kernel=(5, 5), iterations=3)
+            mask = cv2.dilate(mask, kernel=(2, 2), iterations=3)
+
+            # if self.mask_pub.get_num_connections() > 0:
+            #     self.mask_pub.publish(self.bridge.cv2_to_imgmsg(mask, 'mono8'))
+
+            # position relative to the image
+            xy = self.get_center_of_mass(mask)
+            if xy is None:
+                return
 
             telem = self.get_telemetry()
-            self.pub_cord.publish(f'{telem.x:.3} {telem.y:.3} {telem.z:.3}')
-            self.pub_img.publish(self.bridge.cv2_to_imgmsg(img, 'bgr8'))
 
-            self.color_points_cloud.append([round(telem.x, 3), round(telem.y, 3), self.current_color])
+            # position relative to the drone
+            xy3d = self.img_xy_to_point(xy, telem.z)
 
-        self.prev_color = self.current_color
+            # position relative to the aruco_map
+            target = PointStamped(header=msg.header, point=xy3d)
+            setpoint = self.tf_buffer.transform(target, 'aruco_map', timeout=rospy.Duration(0.2))
 
-    def get_color_name2(self, hue):
-        if hue < 15:
-            return 'red'
-        elif hue < 30:
-            return 'orange'
-        elif hue < 60:
-            return 'yellow'
-        elif hue < 90:
-            return 'green'
-        elif hue < 120:
-            return 'cyan'
-        elif hue < 150:
-            return 'blue'
-        elif hue < 170:
-            return 'magenta'
-        else:
-            return 'red'
+            # self.point_pub.publish(target)
 
-    def get_color_name(self, hue, saturation, value):
-        if (50 <= saturation <= 240) and (50 <= value <= 240):
-            if (160 <= hue <= 180) or (0 <= hue <= 12):
-                return 'red'
-            elif (35 <= hue < 110):
-                return 'green'
-            elif (110 < hue < 150):
-                return 'blue'
-            else:
-                return 'none'
-        else:
-            return 'none'
+            self.color_points_cloud.append((round(setpoint.point.x, 3), round(setpoint.point.y, 3), color))
 
-    def set_led_color(self, hue_name):
-        effect = 'flash'
-        if hue_name == 'red':
+            if ((telem.x - setpoint.point.x) ** 2 + (telem.y - setpoint.point.y) ** 2) ** 0.5 <= 0.25:
+                self.set_led_color(color_name=color)
+                led_flag = True
+
+        if not led_flag:
+            self.set_led_color(color_name='none')
+
+    def img_xy_to_point(self, xy, dist):
+        xy = cv2.undistortPoints(xy, self.camera_matrix, self.distortion, P=self.camera_matrix)[0][0]
+
+        # Shift points to center
+        xy -= self.camera_info.width // 2, self.camera_info.height // 2
+
+        fx = self.camera_matrix[0, 0]
+        fy = self.camera_matrix[1, 1]
+
+        return Point(x=xy[0] * dist / fx, y=xy[1] * dist / fy, z=dist)
+
+    def get_center_of_mass(self, mask):
+        M = cv2.moments(mask)
+        if M['m00'] == 0:
+            return None
+        return M['m10'] // M['m00'], M['m01'] // M['m00']
+
+    def set_led_color(self, color_name):
+        effect = 'fill'
+        if color_name == 'red':
             self.set_effect(effect=effect, r=255, g=0, b=0)  # red
-        elif hue_name == 'orange':
+        elif color_name == 'orange':
             self.set_effect(effect=effect, r=255, g=128, b=0)  # orange
-        elif hue_name == 'yellow':
+        elif color_name == 'yellow':
             self.set_effect(effect=effect, r=255, g=255, b=0)  # yellow
-        elif hue_name == 'green':
+        elif color_name == 'green':
             self.set_effect(effect=effect, r=0, g=255, b=0)  # green
-        elif hue_name == 'cyan':
+        elif color_name == 'cyan':
             self.set_effect(effect=effect, r=0, g=128, b=255)  # cyan
-        elif hue_name == 'blue':
+        elif color_name == 'blue':
             self.set_effect(effect=effect, r=0, g=0, b=255)  # blue
-        elif hue_name == 'magenta':
+        elif color_name == 'magenta':
             self.set_effect(effect=effect, r=255, g=0, b=255)  # 'magenta'
-        elif hue_name == 'none':
+        elif color_name == 'none':
             self.set_effect(effect=effect, r=255, g=255, b=255)  # 'white'
         else:
             self.set_effect(effect=effect, r=255, g=0, b=0)  # red
@@ -185,56 +197,62 @@ class Points:
 
     def make_snake(self, len_x, len_y, z=1, step_x=0.25, step_y=1):
         if not self.points:
-            len_x = int(len_x // step_x)
-            len_y = int(len_y // step_y)
-            flag = True
-            for x in range(len_x):
-                if flag:
-                    for y in range(len_y):
-                        self.points.append([round(x * step_x, 3), round(y * step_y, 3), z])
-                        self.size += 1
-                    flag = not flag
-                else:
-                    for y in range(len_y - 1, -1, -1):
-                        self.points.append([round(x * step_x, 3), round(y * step_y, 3), z])
-                        self.size += 1
-                    flag = not flag
+            len_x = int(len_x // step_x - 1 / step_x + 1)
+        len_y = int(len_y // step_y - 1 / step_y + 1)
+        flag = True
+        for x in range(len_x):
+            if flag:
+                for y in range(len_y):
+                    self.points.append([round(x * step_x, 3), round(y * step_y, 3), z])
+                    self.size += 1
+                flag = not flag
+            else:
+                for y in range(len_y - 1, -1, -1):
+                    self.points.append([round(x * step_x, 3), round(y * step_y, 3), z])
+                    self.size += 1
+                flag = not flag
 
 
 # [x, y, {color_name}]
 def get_color_centers(color_arr):
     for_fit = [[i[0], i[1]] for i in color_arr]
-    kmeans = KMeans(n_clusters=4)
+    kmeans = KMeans(n_clusters=3)
     kmeans.fit(for_fit)
     centers = kmeans.cluster_centers_
     res = {}
     for center in centers:
         for color_point in color_arr:
-            if ((color_point[0] - center[0]) ** 2 + (color_point[1] - center[1]) ** 2) ** 0.5 <= 0.7:
+            if ((color_point[0] - center[0]) ** 2 + (color_point[1] - center[1]) ** 2) ** 0.5 <= 0.2:
                 res[f"{center[0], center[1]}"] = color_point[2]
     return res
 
 
 def main():
-    rospy.init_node('cv')
+    rospy.init_node('flight', disable_signals=True)
     coex = COEX()
     cam = CameraStream()
 
+    altitude = 1
+    velocity = 0.3
+
     points = Points()
-    points.make_snake(3, 4, step_x=0.5)
-    points.update_altitude(1)
+    points.make_snake(2, 3)
+    points.update_altitude(altitude)
     for i in points.points:
         print(i)
 
     points.next()
 
     print(f'Moving up  {points.x}, {points.y}, {points.z}')
-    coex.navigate_wait(x=0, y=0, z=1, frame_id='body', auto_arm=True)
-    velocity = 0.5
+    coex.navigate_wait(x=0, y=0, z=altitude, frame_id='body', auto_arm=True)
+
     for point in range(points.size):
         print(f'Moving to {points.x}, {points.y}, {points.z}')
         coex.navigate_wait(x=points.x, y=points.y, z=points.z, speed=velocity, frame_id='aruco_map')
         points.next()
+
+    print("Moving to zero point...")
+    coex.navigate_wait(x=0, y=0, z=altitude, speed=velocity, frame_id='aruco_map')
 
     print("Landing...")
     coex.land_wait()
